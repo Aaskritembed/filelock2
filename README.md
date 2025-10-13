@@ -179,7 +179,3 @@ The codebase is modular for easy maintenance:
 - Regularly rotate keys after unlocking.
 - Local share files are automatically deleted after successful email distribution to minimize exposure.
 - Audit logs help track usage.
-
-## License
-
-This project is provided as-is for educational and secure data management purposes.
