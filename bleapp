@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+BLE GATT Server for Raspberry Pi - Catiline App
+This script makes your RPi discoverable as a BLE device.
+
+Run: sudo python3 ble_server.py
+"""
+
+import dbus
+import dbus.exceptions
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+import array
+import sys
+
+# UUIDs matching the app's configuration
+UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e'
+UART_TX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'  # App writes here
+UART_RX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'  # App reads from here
+
+# Device name - MUST contain "Catiline" to match app's filter
+DEVICE_NAME = 'Catiline-RPi'
+
+BLUEZ_SERVICE_NAME = 'org.bluez'
+GATT_MANAGER_IFACE = 'org.bluez.GattManager1'
+DBUS_OM_IFACE = 'org.freedesktop.DBus.ObjectManager'
+DBUS_PROP_IFACE = 'org.freedesktop.DBus.Properties'
+GATT_SERVICE_IFACE = 'org.bluez.GattService1'
+GATT_CHRC_IFACE = 'org.bluez.GattCharacteristic1'
+GATT_DESC_IFACE = 'org.bluez.GattDescriptor1'
+LE_ADVERTISING_MANAGER_IFACE = 'org.bluez.LEAdvertisingManager1'
+LE_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
+
+mainloop = None
+
+class InvalidArgsException(dbus.exceptions.DBusException):
+    _dbus_error_name = 'org.freedesktop.DBus.Error.InvalidArgs'
+
+class NotSupportedException(dbus.exceptions.DBusException):
+    _dbus_error_name = 'org.bluez.Error.NotSupported'
+
+class NotPermittedException(dbus.exceptions.DBusException):
+    _dbus_error_name = 'org.bluez.Error.NotPermitted'
+
+class Advertisement(dbus.service.Object):
+    PATH_BASE = '/org/bluez/example/advertisement'
+
+    def __init__(self, bus, index, advertising_type):
+        self.path = self.PATH_BASE + str(index)
+        self.bus = bus
+        self.ad_type = advertising_type
+        self.service_uuids = None
+        self.local_name = None
+        self.include_tx_power = False
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_properties(self):
+        properties = dict()
+        properties['Type'] = self.ad_type
+        if self.service_uuids is not None:
+            properties['ServiceUUIDs'] = dbus.Array(self.service_uuids, signature='s')
+        if self.local_name is not None:
+            properties['LocalName'] = dbus.String(self.local_name)
+        if self.include_tx_power:
+            properties['Includes'] = dbus.Array(["tx-power"], signature='s')
+        return {LE_ADVERTISEMENT_IFACE: properties}
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface):
+        if interface != LE_ADVERTISEMENT_IFACE:
+            raise InvalidArgsException()
+        return self.get_properties()[LE_ADVERTISEMENT_IFACE]
+
+    @dbus.service.method(LE_ADVERTISEMENT_IFACE, in_signature='', out_signature='')
+    def Release(self):
+        print(f'{self.path}: Released!')
+
+class UartAdvertisement(Advertisement):
+    def __init__(self, bus, index):
+        Advertisement.__init__(self, bus, index, 'peripheral')
+        self.local_name = DEVICE_NAME
+        self.service_uuids = [UART_SERVICE_UUID]
+        self.include_tx_power = True
+
+class Application(dbus.service.Object):
+    def __init__(self, bus):
+        self.path = '/'
+        self.services = []
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def add_service(self, service):
+        self.services.append(service)
+
+    @dbus.service.method(DBUS_OM_IFACE, out_signature='a{oa{sa{sv}}}')
+    def GetManagedObjects(self):
+        response = {}
+        for service in self.services:
+            response[service.get_path()] = service.get_properties()
+            chrcs = service.get_characteristics()
+            for chrc in chrcs:
+                response[chrc.get_path()] = chrc.get_properties()
+                descs = chrc.get_descriptors()
+                for desc in descs:
+                    response[desc.get_path()] = desc.get_properties()
+        return response
+
+class Service(dbus.service.Object):
+    PATH_BASE = '/org/bluez/example/service'
+
+    def __init__(self, bus, index, uuid, primary):
+        self.path = self.PATH_BASE + str(index)
+        self.bus = bus
+        self.uuid = uuid
+        self.primary = primary
+        self.characteristics = []
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_properties(self):
+        return {
+            GATT_SERVICE_IFACE: {
+                'UUID': self.uuid,
+                'Primary': self.primary,
+                'Characteristics': dbus.Array(
+                    self.get_characteristic_paths(), signature='o')
+            }
+        }
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def add_characteristic(self, characteristic):
+        self.characteristics.append(characteristic)
+
+    def get_characteristic_paths(self):
+        return [chrc.get_path() for chrc in self.characteristics]
+
+    def get_characteristics(self):
+        return self.characteristics
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface):
+        if interface != GATT_SERVICE_IFACE:
+            raise InvalidArgsException()
+        return self.get_properties()[GATT_SERVICE_IFACE]
+
+class Characteristic(dbus.service.Object):
+    def __init__(self, bus, index, uuid, flags, service):
+        self.path = service.path + '/char' + str(index)
+        self.bus = bus
+        self.uuid = uuid
+        self.service = service
+        self.flags = flags
+        self.descriptors = []
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_properties(self):
+        return {
+            GATT_CHRC_IFACE: {
+                'Service': self.service.get_path(),
+                'UUID': self.uuid,
+                'Flags': self.flags,
+                'Descriptors': dbus.Array(self.get_descriptor_paths(), signature='o')
+            }
+        }
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def add_descriptor(self, descriptor):
+        self.descriptors.append(descriptor)
+
+    def get_descriptor_paths(self):
+        return [desc.get_path() for desc in self.descriptors]
+
+    def get_descriptors(self):
+        return self.descriptors
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface):
+        if interface != GATT_CHRC_IFACE:
+            raise InvalidArgsException()
+        return self.get_properties()[GATT_CHRC_IFACE]
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
+    def ReadValue(self, options):
+        print('Default ReadValue called, returning error')
+        raise NotSupportedException()
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
+    def WriteValue(self, value, options):
+        print('Default WriteValue called, returning error')
+        raise NotSupportedException()
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StartNotify(self):
+        print('Default StartNotify called, returning error')
+        raise NotSupportedException()
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StopNotify(self):
+        print('Default StopNotify called, returning error')
+        raise NotSupportedException()
+
+    @dbus.service.signal(DBUS_PROP_IFACE, signature='sa{sv}as')
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass
+
+# UART Service
+class UartService(Service):
+    def __init__(self, bus, index):
+        Service.__init__(self, bus, index, UART_SERVICE_UUID, True)
+        self.add_characteristic(TxCharacteristic(bus, 0, self))
+        self.add_characteristic(RxCharacteristic(bus, 1, self))
+
+# TX Characteristic - App WRITES to this (we receive messages)
+class TxCharacteristic(Characteristic):
+    def __init__(self, bus, index, service):
+        Characteristic.__init__(
+            self, bus, index, UART_TX_CHAR_UUID,
+            ['write', 'write-without-response'], service)
+
+    def WriteValue(self, value, options):
+        message = bytes(value).decode('utf-8')
+        print(f'\n📥 RECEIVED FROM APP: {message}')
+        print('-' * 40)
+        
+        # Here you can add your custom logic to handle the message
+        # For example, if it's WiFi credentials:
+        try:
+            import json
+            data = json.loads(message)
+            if 'ssid' in data and 'password' in data:
+                print(f"   WiFi SSID: {data['ssid']}")
+                print(f"   WiFi Password: {data['password']}")
+                # TODO: Connect to WiFi here
+        except:
+            print(f"   Raw message: {message}")
+
+# RX Characteristic - App READS from this (we send messages)
+class RxCharacteristic(Characteristic):
+    def __init__(self, bus, index, service):
+        Characteristic.__init__(
+            self, bus, index, UART_RX_CHAR_UUID,
+            ['notify', 'read'], service)
+        self.notifying = False
+        self.value = []
+
+    def ReadValue(self, options):
+        return self.value
+
+    def StartNotify(self):
+        if self.notifying:
+            return
+        self.notifying = True
+        print('🔔 Notifications enabled - app is listening')
+
+    def StopNotify(self):
+        if not self.notifying:
+            return
+        self.notifying = False
+        print('🔕 Notifications disabled')
+
+    def send_message(self, message):
+        """Call this to send a message to the app"""
+        if not self.notifying:
+            print('⚠️  Cannot send - app is not listening')
+            return
+        self.value = array.array('B', message.encode('utf-8')).tolist()
+        self.PropertiesChanged(GATT_CHRC_IFACE, {'Value': self.value}, [])
+        print(f'📤 SENT TO APP: {message}')
+
+def find_adapter(bus):
+    remote_om = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, '/'),
+                               DBUS_OM_IFACE)
+    objects = remote_om.GetManagedObjects()
+    for o, props in objects.items():
+        if GATT_MANAGER_IFACE in props.keys():
+            return o
+    return None
+
+def register_app_cb():
+    print('✅ GATT application registered')
+
+def register_app_error_cb(error):
+    print(f'❌ Failed to register application: {error}')
+    mainloop.quit()
+
+def register_ad_cb():
+    print('✅ Advertisement registered')
+
+def register_ad_error_cb(error):
+    print(f'❌ Failed to register advertisement: {error}')
+    mainloop.quit()
+
+def main():
+    global mainloop
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+
+    adapter = find_adapter(bus)
+    if not adapter:
+        print('❌ BLE adapter not found')
+        return
+
+    print(f'Using adapter: {adapter}')
+
+    # Get GATT manager
+    service_manager = dbus.Interface(
+        bus.get_object(BLUEZ_SERVICE_NAME, adapter),
+        GATT_MANAGER_IFACE)
+
+    # Get advertising manager
+    ad_manager = dbus.Interface(
+        bus.get_object(BLUEZ_SERVICE_NAME, adapter),
+        LE_ADVERTISING_MANAGER_IFACE)
+
+    # Create and register application
+    app = Application(bus)
+    uart_service = UartService(bus, 0)
+    app.add_service(uart_service)
+
+    # Create advertisement
+    advertisement = UartAdvertisement(bus, 0)
+
+    mainloop = GLib.MainLoop()
+
+    print(f'\n{"="*50}')
+    print(f'🚀 Starting BLE GATT Server')
+    print(f'   Device Name: {DEVICE_NAME}')
+    print(f'   Service UUID: {UART_SERVICE_UUID}')
+    print(f'{"="*50}\n')
+
+    # Register advertisement
+    ad_manager.RegisterAdvertisement(advertisement.get_path(), {},
+                                     reply_handler=register_ad_cb,
+                                     error_handler=register_ad_error_cb)
+
+    # Register GATT application
+    service_manager.RegisterApplication(app.get_path(), {},
+                                        reply_handler=register_app_cb,
+                                        error_handler=register_app_error_cb)
+
+    print('📡 Advertising... Waiting for connections...')
+    print('   (Press Ctrl+C to stop)\n')
+
+    try:
+        mainloop.run()
+    except KeyboardInterrupt:
+        print('\n\n👋 Shutting down...')
+        ad_manager.UnregisterAdvertisement(advertisement.get_path())
+        print('Done!')
+
+if __name__ == '__main__':
+    main()
